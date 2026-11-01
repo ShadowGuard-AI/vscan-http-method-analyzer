@@ -64,6 +64,11 @@ def analyze_http_methods(url, timeout, user_agent, insecure=False):
         response = requests.options(url, timeout=timeout, headers=headers, verify=verify)
         results['reachable'] = True
         allowed_methods_header = response.headers.get('Allow')
+            # Methods named in the Allow header are recorded on the
+            # server's word alone. If a later probe of the same method
+            # is rejected, the header entry stays in the allowed list,
+            # so the result mixes what the server claims with what the
+            # probes below actually saw accepted.
         if allowed_methods_header:
             for method in [m.strip().upper() for m in allowed_methods_header.split(',') if m.strip()]:
                 note_allowed(method, "Allow header")
@@ -87,6 +92,10 @@ def analyze_http_methods(url, timeout, user_agent, insecure=False):
         logging.debug(f"Baseline probe failed: {e}")
 
     # Per method probing, independent of the OPTIONS outcome.
+    # TRACK is in the risky list but not in this probe list, so it
+    # can only ever be reported when an Allow header names it. Each
+    # probe also builds a fresh session, so no cookie or state from
+    # the baseline request carries into the method being tested.
     all_methods = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'TRACE', 'PATCH', 'CONNECT']
     for method in all_methods:
         if method == 'OPTIONS':
