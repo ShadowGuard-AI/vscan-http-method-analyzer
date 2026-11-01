@@ -1,7 +1,6 @@
 import argparse
 import requests
 import logging
-from bs4 import BeautifulSoup
 import sys
 
 # Configure logging
@@ -16,9 +15,10 @@ def setup_argparse():
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output (debug logging)")
     parser.add_argument("-t", "--timeout", type=int, default=5, help="Timeout for HTTP requests in seconds (default: 5)")
     parser.add_argument("-u", "--user-agent", type=str, default="vscan-http-method-analyzer/1.0", help="Custom User-Agent string")
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification for every request (default: verification on). Use only on targets you are authorized to test.")
     return parser.parse_args()
 
-def analyze_http_methods(url, timeout, user_agent):
+def analyze_http_methods(url, timeout, user_agent, insecure=False):
     """
     Analyzes the allowed HTTP methods for a given URL.
 
@@ -40,61 +40,85 @@ def analyze_http_methods(url, timeout, user_agent):
         'url': url,
         'allowed_methods': [],
         'potentially_risky_methods': [],
-        'errors': []
+        'errors': [],
+        'reachable': False
     }
 
     risky_methods = ['PUT', 'DELETE', 'TRACE', 'TRACK', 'CONNECT']  # Methods to flag as potentially risky
+    verify = not insecure
+    if insecure:
+        logging.warning("TLS certificate verification disabled by the --insecure flag.")
 
+    def note_allowed(method, why):
+        if method not in results['allowed_methods']:
+            results['allowed_methods'].append(method)
+            logging.warning(f"Method '{method}' is allowed for {url} ({why})")
+        if method in risky_methods and method not in results['potentially_risky_methods']:
+            results['potentially_risky_methods'].append(method)
+
+    headers = {'User-Agent': user_agent}
+
+    # OPTIONS request to determine allowed methods. Its status never
+    # gates the probing below: an error status is read, not raised.
     try:
-        # OPTIONS request to determine allowed methods
-        headers = {'User-Agent': user_agent}
-        response = requests.options(url, timeout=timeout, headers=headers)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-
+        response = requests.options(url, timeout=timeout, headers=headers, verify=verify)
+        results['reachable'] = True
         allowed_methods_header = response.headers.get('Allow')
         if allowed_methods_header:
-            allowed_methods = [method.strip().upper() for method in allowed_methods_header.split(',')]
-            results['allowed_methods'] = allowed_methods
-
-            for method in allowed_methods:
-                if method in risky_methods:
-                    results['potentially_risky_methods'].append(method)
-                    logging.warning(f"Potentially risky HTTP method '{method}' is allowed for {url}")
-
+            for method in [m.strip().upper() for m in allowed_methods_header.split(',') if m.strip()]:
+                note_allowed(method, "Allow header")
         else:
-            logging.warning(f"No 'Allow' header found in OPTIONS response for {url}")
-            results['errors'].append("No 'Allow' header found in OPTIONS response.")
-
-
-        # Check for methods without OPTIONS
-        all_methods = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'TRACE', 'PATCH', 'CONNECT']  # Common HTTP methods
-        for method in all_methods:
-            try:
-                headers = {'User-Agent': user_agent}
-                if method == 'OPTIONS':
-                    continue # Avoid redundant OPTIONS check
-                req = requests.Request(method, url, headers=headers)
-                prepared = req.prepare()
-                s = requests.Session()
-                response = s.send(prepared, timeout=timeout, verify=False)
-
-                if response.status_code != 405: # 405 Method Not Allowed is the expected response if the method is not enabled
-                    if response.status_code < 500: # Filter out server errors
-                        logging.warning(f"Method '{method}' may be allowed for {url} (Status Code: {response.status_code})")
-                        if method not in results['allowed_methods']:
-                           results['allowed_methods'].append(method)
-                        if method in risky_methods:
-                            results['potentially_risky_methods'].append(method)
-
-            except requests.exceptions.RequestException as e:
-                logging.debug(f"Error checking method {method}: {e}")
-                pass # Errors are acceptable here since we are probing various methods
-
+            logging.info(f"No 'Allow' header found in OPTIONS response for {url}")
     except requests.exceptions.RequestException as e:
-        error_message = f"Error analyzing {url}: {e}"
+        error_message = f"OPTIONS request failed for {url}: {e}"
         logging.error(error_message)
         results['errors'].append(error_message)
 
+    # Baseline: the status the endpoint returns for a nonsense method.
+    # A probe status only counts as evidence when it differs from this.
+    baseline_status = None
+    try:
+        req = requests.Request('ZZZNONSENSE', url, headers=headers)
+        s = requests.Session()
+        baseline_response = s.send(req.prepare(), timeout=timeout, verify=verify)
+        results['reachable'] = True
+        baseline_status = baseline_response.status_code
+    except requests.exceptions.RequestException as e:
+        logging.debug(f"Baseline probe failed: {e}")
+
+    # Per method probing, independent of the OPTIONS outcome.
+    all_methods = ['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'TRACE', 'PATCH', 'CONNECT']
+    for method in all_methods:
+        if method == 'OPTIONS':
+            continue # Avoid redundant OPTIONS check
+        try:
+            req = requests.Request(method, url, headers=headers)
+            prepared = req.prepare()
+            s = requests.Session()
+            response = s.send(prepared, timeout=timeout, verify=verify)
+            results['reachable'] = True
+            status = response.status_code
+            if status == 405 or status >= 500:
+                continue
+            # Evidence the method itself was accepted: a 2xx response,
+            # a redirect that differs from the baseline, or another
+            # status that differs from a usable nonsense method baseline.
+            # Resource level statuses (400, 401, 403, 404, 410) are no
+            # evidence on their own, and a baseline at 5xx means the
+            # server rejected the nonsense method itself, so it cannot
+            # be used for comparison.
+            resource_level = status in (400, 401, 403, 404, 410)
+            baseline_usable = baseline_status is not None and baseline_status < 500
+            if 200 <= status < 300:
+                note_allowed(method, f"Status Code: {status}, baseline: {baseline_status}")
+            elif not resource_level and baseline_usable and status != baseline_status:
+                note_allowed(method, f"Status Code: {status}, baseline: {baseline_status}")
+        except requests.exceptions.RequestException as e:
+            logging.debug(f"Error checking method {method}: {e}")
+            pass # Errors are acceptable here since we are probing various methods
+
+    if not results['reachable']:
+        results['errors'].append(f"Target {url} could not be reached at all; no method verdict was earned.")
 
     return results
 
@@ -115,6 +139,11 @@ def print_results(results):
         for error in results['errors']:
             print(f"  - {error}")
         print("-" * 20)
+
+    if not results.get('reachable', True):
+        print("Analysis failed: the target could not be reached, so no method verdict is reported.")
+        print("-" * 20)
+        return
 
     if results['allowed_methods']:
         print("Allowed HTTP Methods:")
@@ -154,8 +183,10 @@ def main():
         print("Error: URL must start with http:// or https://")
         sys.exit(1)
 
-    results = analyze_http_methods(url, timeout, user_agent)
+    results = analyze_http_methods(url, timeout, user_agent, insecure=args.insecure)
     print_results(results)
+    if not results.get('reachable', False):
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
